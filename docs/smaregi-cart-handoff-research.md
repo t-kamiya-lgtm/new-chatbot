@@ -382,6 +382,92 @@ Cookie制限の対象にもなる)。「同一オリジンなら都合よくパ�
    設計するのが妥当と考えられる。
 7. 本番環境での安全なテスト手順の設計(サンドボックスなしのため) — 未着手。
 
+## 5. 実装アーキテクチャ設計(たたき台)
+
+4.6・4.7で判明した一次情報を踏まえ、次セッションでの実装着手に向けたたたき台として、決済手段ごとの
+処理フローと、チャット側DBの最終的な保持範囲を整理する。あくまで叩き台であり、実装時の詳細検証で
+調整が必要な箇所を含む。
+
+### 5.1 カード決済(Stripe)のフロー
+
+**初回**
+1. チャットが商品・数量・氏名・住所等を画面上で収集する(この時点ではチャット側DBへ保存しない。
+   サーバーメモリ上でStripe/受注APIへの送信にのみ使い、レスポンス後は保持しない)。
+2. 単発はStripe Payment Element、定期はStripe Billingで決済を実行する(既存の`payment-intent`/
+   `subscription` routeの決済処理自体は流用できる想定)。
+3. **Stripeの決済成功webhookを起点**に、受注API(`/api/v2/orders/create`)へ受注データを送信する。
+   - `order.customer_id = -1`(自動名寄せで顧客作成、4.6.2で確認済み)
+   - `order.payment_id`はカード決済相当のコード(旧`smaregi-order-sync.ts`では`77`だったが、
+     primedirect.jp契約側での実際の値は要確認)
+   - `order.payment_status`は決済済み相当の値(4.6.2時点で未確定、`debug-orders`での実データ確認が必要)
+   - 単発の場合は`periodical_order`パラメータを付与しない。定期の場合も、**2回目以降の請求は
+     Stripe Billingが担う**ため、smaregi側の`periodical_order`同時作成(`periodical_order_id=-1`)は
+     行わない想定(=初回分の通常受注としてのみ連携する)。
+4. 最小限の紐づけテーブル(5.3)に、定期の場合のみ`stripe_subscription_id`・受注APIから返る
+   スマレジ側参照ID(`customer_id`/`order_id`)・次回請求日・周期ごとの金額を保存する。
+
+**2回目以降(定期のみ)**
+- Stripe Billingが自動的に課金・請求書発行を行う。
+- Stripeの決済成功webhookを起点に、都度受注API経由でprimedirect.jpへ新規受注を作成し
+  (`order.customer_id`は初回で確定した値を紐づけテーブルから引くか、再度`-1`で自動名寄せに任せる)、
+  出荷はスマレジ側の既存フロー(primedirect.jp→通販ゲートの自動連携)に乗せる。
+- 紐づけテーブルの次回請求日・金額を最新化する。
+
+### 5.2 代引き・後払いのフロー
+
+**初回**
+- チャットが収集したデータを受注API経由でprimedirect.jpへ送信(`customer_id=-1`)。
+- 定期の場合は同時に`periodical_order_id=-1` + `period_type` + `next_period`を指定し、
+  `periodical_order_detail.first_price_*`(初回特別価格)/`second_price_*`(2回目以降の通常価格)を
+  明細ごとに指定することで、smaregi純正の定期申込を初回受注と同時に作成する(4.6.3)。
+
+**2回目以降**
+- **smaregi側`periodical_order`のネイティブ機構がそのまま自動で請求・受注生成を行う**。
+  チャット側は何もデータを持たず、何も処理しない(現行`subscription-renewal.ts`のロジックは不要になる)。
+
+### 5.3 最小限の紐づけテーブルのスキーマ案(個人情報を一切含まない)
+
+```
+subscription_links (仮称)
+  id                    -- 内部PK
+  stripe_subscription_id  -- Stripeサブスクリプション参照ID(カード決済の定期のみ)
+  primedirect_customer_id -- primedirect.jp側の顧客ID(customer_id、-1名寄せ後の確定値)
+  primedirect_order_id    -- 初回受注のorder_id(参考・トレース用)
+  next_billing_date       -- 次回請求日
+  amount                  -- 周期ごとの金額
+  status                  -- active/canceled等
+  created_at / updated_at
+```
+
+代引き・後払いの定期はsmaregi純正`periodical_order`に完全に任せるため、このテーブルは
+**Stripeの定期(カード)のみを対象**にすればよい。
+
+### 5.4 チャット側DBの保持範囲(最終形・現行からの変更点)
+
+- `src/app/api/checkout/payment-intent/route.ts` / `subscription/route.ts` / `deferred/route.ts`:
+  住所・氏名等を`customers`/`orders`テーブルへ書き込む処理を廃止し、受注API/カートAPIへの
+  パススルー送信に置き換える。
+- `leads`テーブル: 保持項目をメールアドレスのみに縮小する(氏名・電話・アンケート回答等は廃止)。
+- 新設: 5.3の`subscription_links`(PIIなし)。
+- `customer-detail.ts` / `CustomerDetailView.tsx`: 顧客の氏名・住所等の表示は、primedirect.jp
+  顧客API(`/api/v2/customers/search`)から都度取得する形に置き換える。
+- `subscription-analysis*`: 依存関係を再確認し、氏名・住所等の実PIIに依存している箇所があれば
+  同様にAPI経由の都度取得に置き換える。
+- `customer_retention_actions`・クーポン使用履歴等: 影響範囲の洗い出しが必要(未着手)。
+- `smaregi-client.ts`: 現行はスマレジEC・リピートAPI(v1想定)のクライアントだが、primedirect.jpの
+  実エンドポイントはAPI v2(`https://www.primedirect.jp/api/v2/...`)であるため、エンドポイント・
+  認証方式の見直しが必要。
+- `src/lib/adapters/core-system.ts`(通販ゲート連携アダプタ): 代引き・後払いがスマレジEC経由の
+  自動連携に乗るのであれば、このアダプタ自体が不要になる可能性が高い(要最終確認)。
+
+### 5.5 未確定のまま残る事項(実装前に確認が必要)
+
+- `order.payment_status`の「決済済み」に相当する具体的な値(`debug-orders`での実データ確認)
+- カード決済の`payment_id`の実際の値(primedirect.jp契約側での確認)
+- 「代引き(配送時現金回収)」自体への対応可否(現行の基幹システム連携を残すかどうかに直結)
+- 本番環境での安全なテスト手順(サンドボックスがないため、少額・自社宛のテスト注文+即キャンセル/
+  返金の運用設計が必要)
+
 ## 参考(検索で確認できた一次情報のURL)
 
 - カートインURL機能: https://ec.smaregi.jp/repeat/faq/item/02-0425/
