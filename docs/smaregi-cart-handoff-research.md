@@ -400,7 +400,10 @@ Cookie制限の対象にもなる)。「同一オリジンなら都合よくパ�
    - `order.customer_id = -1`(自動名寄せで顧客作成、4.6.2で確認済み)
    - `order.payment_id`はカード決済相当のコード(旧`smaregi-order-sync.ts`では`77`だったが、
      primedirect.jp契約側での実際の値は要確認)
-   - `order.payment_status`は決済済み相当の値(4.6.2時点で未確定、`debug-orders`での実データ確認が必要)
+   - `order.payment_status`は決済済み相当の値(スマレジ管理画面上の表示ラベルは「支払い済み」。
+     対応する実際の数値は4.6.2時点で未確定、`debug-orders`での実データ確認が必要。2026-10-07追記:
+     Stripeで決済が完了した時点でprimedirect.jpへ受注を作成するため、作成時点から常に「支払い済み」
+     ステータスで連携する設計で確定——代引き・後払いの「未入金のまま受注だけ先行作成」とはここが異なる)
    - 単発の場合は`periodical_order`パラメータを付与しない。定期の場合も、**2回目以降の請求は
      Stripe Billingが担う**ため、smaregi側の`periodical_order`同時作成(`periodical_order_id=-1`)は
      行わない想定(=初回分の通常受注としてのみ連携する)。
